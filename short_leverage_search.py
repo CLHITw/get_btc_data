@@ -145,7 +145,7 @@ def run_combined_short_lev(df, profiles,
         for idx in md_idx:
             row = valid.loc[idx]
             if long_stop is not None and row['date'] > row0['date']:
-                if (row['close'] / entry_p - 1) * pos <= long_stop:
+                if (row['low'] / entry_p - 1) * pos <= long_stop:  # 用日内最低价
                     break
             long_pos_list[idx] = pos
 
@@ -166,7 +166,8 @@ def run_combined_short_lev(df, profiles,
         last_n = vote_win[-consecutive:] if len(vote_win) >= consecutive else []
 
         if s_pos < 0 and s_entry is not None:
-            raw_pnl = (price / s_entry - 1) * (-1)
+            worst_price = row['high']               # 空头最坏价格为日内最高
+            raw_pnl = (worst_price / s_entry - 1) * (-1)
             levered_pnl = raw_pnl * abs(s_pos)
             if levered_pnl <= short_stop:
                 s_pos, s_entry = 0.0, None

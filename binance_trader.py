@@ -91,6 +91,8 @@ LOG_FILE        = os.path.join(DATA_DIR,
                   "trader_testnet.log"        if TESTNET else "trader.log")
 SIGNAL_LOG_FILE = os.path.join(DATA_DIR,
                   "trader_signal_testnet.log" if TESTNET else "trader_signal.log")
+PNL_LOG_FILE    = os.path.join(DATA_DIR,
+                  "pnl_testnet.json"          if TESTNET else "pnl_records.json")
 
 # --- 策略参数（与回测保持一致，不要修改）---
 LONG_LEV_MAP        = {4: 1.0, 5: 1.5, 6: 2.0}
@@ -101,6 +103,13 @@ SHORT_STOP_LOSS     = -0.08
 BOLL_OVERFLOW       = 3.5
 BEAR_CONSECUTIVE    = 3
 BULL_EXIT_CONSECUTIVE = 3
+
+# 方案B：多头月中连续N天BEAR则提前平仓
+MIDMONTH_BEAR_CONSEC = 4
+
+# 空头入场特征过滤（两条件须同时满足）
+SHORT_MACD_HIST_MAX = -1.0   # macd_hist_z 必须 < 此值（动量已明显转弱）
+SHORT_VOL_MIN       = 0.0    # volume_log_z 必须 > 此值（放量下跌才可信）
 
 # --- Binance USDT-M 合约 REST API ---
 FUTURES_URL = ("https://testnet.binancefuture.com"
@@ -147,6 +156,8 @@ def default_state() -> dict:
             "month":        None,     # 格式 "YYYY-MM"
             "vote":         None,
             "bull_n":       0,
+            "bear_window":  [],       # 月中BEAR信号滑动窗口（方案B）
+            "sl_order_id":  None,     # 币安止损委托单ID
         },
         "short_leg": {
             "active":       False,
@@ -156,6 +167,7 @@ def default_state() -> dict:
             "entry_date":   None,
             "vote_window":  [],       # 近3天投票，用于空头逻辑
             "bear_n":       0,
+            "sl_order_id":  None,     # 币安止损委托单ID
         },
         "last_run_date": None,
     }
@@ -180,6 +192,41 @@ def load_state() -> dict:
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+
+
+def append_pnl_record(close_date, leg: str, entry_date, entry_price: float,
+                      exit_price: float, pos_ratio: float, reason: str):
+    """平仓时记录已实现收益到 pnl_records.json（供网页累计收益图使用）"""
+    try:
+        records = []
+        if os.path.exists(PNL_LOG_FILE):
+            with open(PNL_LOG_FILE, "r", encoding="utf-8") as f:
+                records = json.load(f)
+    except Exception:
+        records = []
+
+    if leg == "long":
+        pnl_pct = (exit_price / entry_price - 1) * pos_ratio * 100
+    else:  # short
+        pnl_pct = (entry_price / exit_price - 1) * pos_ratio * 100
+
+    prev_cum = records[-1]["cumulative_pct"] if records else 0.0
+    new_cum  = (1 + prev_cum / 100) * (1 + pnl_pct / 100) * 100 - 100
+
+    records.append({
+        "close_date":     str(close_date),
+        "leg":            leg,
+        "entry_date":     str(entry_date),
+        "entry_price":    round(entry_price, 2),
+        "exit_price":     round(exit_price, 2),
+        "pos_ratio":      pos_ratio,
+        "pnl_pct":        round(pnl_pct, 2),
+        "cumulative_pct": round(new_cum, 2),
+        "reason":         reason,
+    })
+    with open(PNL_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2, default=str)
+    log.info(f"  P&L记录: [{leg}] {reason}  pnl={pnl_pct:+.1f}%  累计={new_cum:+.1f}%")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -233,6 +280,36 @@ def fapi_get(path: str, params: dict = None, signed: bool = False) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def fapi_delete(path: str, params: dict, retries: int = 2) -> dict:
+    """
+    Binance USDT-M 合约 DELETE 请求（用于撤销委托单）。
+    签名方式与 POST 相同，但使用 requests.delete + query string 传参。
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            p = dict(params)
+            p["timestamp"] = _timestamp()
+            qs  = urlencode(p)
+            sig = _sign(qs)
+            resp = requests.delete(
+                FUTURES_URL + path + "?" + qs + "&signature=" + sig,
+                headers=_headers(),
+                timeout=10,
+            )
+            data = resp.json() if resp.text.strip() else {}
+            if resp.status_code != 200:
+                raise RuntimeError(f"Binance DELETE 错误 {resp.status_code}: {data}")
+            return data
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2)
+    raise RuntimeError(f"DELETE {path} 重试{retries}次均失败: {last_err}")
 
 
 def fapi_post(path: str, params: dict, retries: int = 3) -> dict:
@@ -439,6 +516,59 @@ def close_short(quantity: float):
     log.info(f"     订单ID={res.get('orderId')}  状态={res.get('status')}")
 
 
+def cancel_sl_order(order_id: int, leg: str):
+    """撤销止损委托单（平仓前必须先撤，否则会重复平仓）。使用 DELETE 方法。"""
+    if not order_id:
+        return
+    try:
+        fapi_delete("/fapi/v1/order", {"symbol": SYMBOL, "orderId": order_id})
+        log.info(f"  ✅ 已撤销{leg}止损单 orderId={order_id}")
+    except Exception as e:
+        # 已成交或不存在都忽略（静默失败）
+        log.warning(f"  撤销{leg}止损单失败（可能已触发或不存在）: {e}")
+
+
+def place_sl_order(leg: str, entry_price: float, pos_ratio: float) -> int:
+    """
+    开仓后在币安挂止损市价单（STOP_MARKET + closePosition=true）。
+    止损价 = entry_price × (1 ± stop_pct/pos_ratio)，向不利方向取整以防穿透。
+    返回止损单 orderId（失败时返回 None）。
+    """
+    try:
+        if leg == "long":
+            raw_stop_pct = abs(LONG_STOP_LOSS) / pos_ratio   # e.g. 0.15/1.5 = 0.10
+            stop_price   = entry_price * (1 - raw_stop_pct)
+            stop_price   = math.floor(stop_price)            # 向下取整，确保触发
+            res = fapi_post("/fapi/v1/order", {
+                "symbol":        SYMBOL,
+                "side":          "SELL",
+                "positionSide":  "LONG",
+                "type":          "STOP_MARKET",
+                "stopPrice":     stop_price,
+                "closePosition": "true",
+                "workingType":   "MARK_PRICE",   # 用标记价格触发，防止插针假触发
+            })
+        else:  # short
+            raw_stop_pct = abs(SHORT_STOP_LOSS) / pos_ratio
+            stop_price   = entry_price * (1 + raw_stop_pct)
+            stop_price   = math.ceil(stop_price)             # 向上取整
+            res = fapi_post("/fapi/v1/order", {
+                "symbol":        SYMBOL,
+                "side":          "BUY",
+                "positionSide":  "SHORT",
+                "type":          "STOP_MARKET",
+                "stopPrice":     stop_price,
+                "closePosition": "true",
+                "workingType":   "MARK_PRICE",
+            })
+        order_id = res.get("orderId")
+        log.info(f"  ✅ {leg}止损单已挂: stopPrice={stop_price:.0f}  orderId={order_id}")
+        return order_id
+    except Exception as e:
+        log.error(f"  ❌ 挂{leg}止损单失败: {e}")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ⑤ 数据与策略工具
 # ══════════════════════════════════════════════════════════════════════
@@ -502,6 +632,41 @@ def compute_vote(row: pd.Series, profiles: dict) -> tuple:
     return vote, sig_ok, bull_n, bear_n
 
 
+def save_vote_to_excel(row_date, bull_n: int, bear_n: int, neut_n: int, vote: str):
+    """将当日投票结果写回 btc.xlsx（bull/bear/neutral 票数 + vote_result）"""
+    try:
+        df = pd.read_excel(BTC_FILE)
+        df["date"] = pd.to_datetime(df["date"])
+        target = pd.Timestamp(row_date)
+        mask = df["date"].dt.date == target.date()
+        if not mask.any():
+            log.warning(f"  save_vote: 未找到日期 {row_date}，跳过写入")
+            return
+        df.loc[mask, "bull"]        = bull_n
+        df.loc[mask, "bear"]        = bear_n
+        df.loc[mask, "neutral"]     = neut_n
+        df.loc[mask, "vote_result"] = vote
+        df.to_excel(BTC_FILE, index=False)
+        log.info(f"  投票写入btc.xlsx: BULL={bull_n} BEAR={bear_n} NEUT={neut_n} → {vote}")
+    except Exception as e:
+        log.warning(f"  写入投票结果失败: {e}")
+
+
+def init_vote_window_from_excel(state: dict):
+    """启动时从 btc.xlsx vote_result 列重建空头投票窗口（比状态文件更可靠）"""
+    try:
+        df = pd.read_excel(BTC_FILE)
+        if "vote_result" not in df.columns:
+            log.info("btc.xlsx 无 vote_result 列，跳过窗口重建")
+            return
+        recent = df["vote_result"].dropna().tail(BEAR_CONSECUTIVE).tolist()
+        if recent:
+            state["short_leg"]["vote_window"] = recent
+            log.info(f"启动窗口重建(来自btc.xlsx): {recent}")
+    except Exception as e:
+        log.warning(f"重建投票窗口失败: {e}")
+
+
 def is_first_trading_day_of_month(data_date: date, df: pd.DataFrame) -> bool:
     """
     数据日期（最新K线日期）是否是该月第一个有K值的交易日。
@@ -552,9 +717,14 @@ def handle_long_leg(state: dict, row: pd.Series, profiles: dict,
         # 平掉上月仓位
         if long["active"]:
             log.info(f"  → 平上月多头 qty={long['quantity']}")
+            cancel_sl_order(long.get("sl_order_id"), "多头")
+            if long.get("entry_price"):
+                append_pnl_record(today, "long", long.get("entry_date"),
+                                  long["entry_price"], current_price,
+                                  long["pos_ratio"], "month_end")
             close_long(long["quantity"])
             long.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
-                         "entry_price": None, "entry_date": None})
+                         "entry_price": None, "entry_date": None, "sl_order_id": None})
 
         # 决策逻辑（与 strategy_evaluation.py 一致）
         if vote in ("BULL", "NEUTRAL", "BEAR"):
@@ -579,32 +749,65 @@ def handle_long_leg(state: dict, row: pd.Series, profiles: dict,
         if pos_ratio > 0:
             log.info(f"  → 开多: fv={fv} bull_n={bull_n} pos_ratio={pos_ratio}x")
             qty = open_long(pos_ratio, current_price)
+            sl_id = place_sl_order("long", current_price, pos_ratio) if qty > 0 else None
             long.update({
-                "active":      qty > 0,
-                "pos_ratio":   pos_ratio,
-                "quantity":    qty,
-                "entry_price": current_price,
-                "entry_date":  str(row_date),
-                "month":       data_ym,
-                "vote":        fv,
-                "bull_n":      bull_n,
+                "active":       qty > 0,
+                "pos_ratio":    pos_ratio,
+                "quantity":     qty,
+                "entry_price":  current_price,
+                "entry_date":   str(row_date),
+                "month":        data_ym,
+                "vote":         fv,
+                "bull_n":       bull_n,
+                "bear_window":  [],       # 月初重置月中BEAR窗口
+                "sl_order_id":  sl_id,
             })
         else:
             log.info(f"  → 月初无多头信号 (fv={fv})")
             long.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
-                         "month": data_ym})
+                         "month": data_ym, "bear_window": []})
 
-    # ── 月中：检查止损 ────────────────────────────────────────────
+    # ── 月中：检查止损 + 方案B（连续BEAR信号提前平仓） ───────────
     elif long["active"] and long["entry_price"]:
         raw_ret     = current_price / long["entry_price"] - 1
         levered_ret = raw_ret * long["pos_ratio"]
         log.info(f"  → 持仓中: entry={long['entry_price']:.0f}  "
                  f"now={current_price:.0f}  净收益={levered_ret*100:.1f}%")
-        if levered_ret <= LONG_STOP_LOSS:
-            log.info(f"  ⚠️ 多头止损触发 ({levered_ret*100:.1f}% ≤ {LONG_STOP_LOSS*100:.0f}%)")
+
+        # 维护月中BEAR窗口
+        bwin = long.setdefault("bear_window", [])
+        bwin.append(vote)
+        if len(bwin) > MIDMONTH_BEAR_CONSEC:
+            bwin.pop(0)
+
+        # 方案B：月中连续N天BEAR → 提前平多头
+        if (len(bwin) == MIDMONTH_BEAR_CONSEC
+                and all(v == "BEAR" for v in bwin)):
+            log.info(f"  ⚠️ 月中连续{MIDMONTH_BEAR_CONSEC}天BEAR，提前平多头")
+            slog.warning(f"📤 多头月中BEAR平仓(连续{MIDMONTH_BEAR_CONSEC}天BEAR)  "
+                         f"entry=${long['entry_price']:,.0f} → now=${current_price:,.0f}  "
+                         f"净收益={levered_ret*100:+.1f}%")
+            append_pnl_record(today, "long", long.get("entry_date"),
+                              long["entry_price"], current_price,
+                              long["pos_ratio"], "midmonth_bear_exit")
+            cancel_sl_order(long.get("sl_order_id"), "多头")
             close_long(long["quantity"])
             long.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
-                         "entry_price": None})
+                         "entry_price": None, "bear_window": [], "sl_order_id": None})
+            return
+
+        # 原始止损（软件层兜底，币安止损单应已优先触发）
+        if levered_ret <= LONG_STOP_LOSS:
+            log.info(f"  ⚠️ 多头止损触发 ({levered_ret*100:.1f}% ≤ {LONG_STOP_LOSS*100:.0f}%)")
+            slog.warning(f"🚨 多头止损触发! 净亏损={levered_ret*100:.1f}%  "
+                         f"entry=${long['entry_price']:,.0f} → now=${current_price:,.0f}")
+            append_pnl_record(today, "long", long.get("entry_date"),
+                              long["entry_price"], current_price,
+                              long["pos_ratio"], "stop_loss")
+            cancel_sl_order(long.get("sl_order_id"), "多头")
+            close_long(long["quantity"])
+            long.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
+                         "entry_price": None, "bear_window": [], "sl_order_id": None})
     else:
         log.info("  → 本月无多头仓位，跳过")
 
@@ -645,19 +848,29 @@ def handle_short_leg(state: dict, row: pd.Series, profiles: dict,
 
         if levered_pnl <= SHORT_STOP_LOSS:
             log.info(f"  ⚠️ 空头止损触发 ({levered_pnl*100:.1f}% ≤ {SHORT_STOP_LOSS*100:.0f}%)")
+            slog.warning(f"🚨 空头止损触发! 净亏损={levered_pnl*100:.1f}%  "
+                         f"entry=${short['entry_price']:,.0f} → now=${current_price:,.0f}")
+            append_pnl_record(today, "short", short.get("entry_date"),
+                              short["entry_price"], current_price,
+                              short["pos_ratio"], "stop_loss")
+            cancel_sl_order(short.get("sl_order_id"), "空头")
             close_short(short["quantity"])
             short.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
                           "entry_price": None, "entry_date": None,
-                          "vote_window": [], "bear_n": 0})
+                          "vote_window": [], "bear_n": 0, "sl_order_id": None})
             return
 
         if (len(last_n_bull) == BULL_EXIT_CONSECUTIVE
                 and all(v == "BULL" for v in last_n_bull)):
             log.info("  → 空头信号翻转（连续 BULL），平空")
+            append_pnl_record(today, "short", short.get("entry_date"),
+                              short["entry_price"], current_price,
+                              short["pos_ratio"], "bull_exit")
+            cancel_sl_order(short.get("sl_order_id"), "空头")
             close_short(short["quantity"])
             short.update({"active": False, "pos_ratio": 0.0, "quantity": 0.0,
                           "entry_price": None, "entry_date": None,
-                          "bear_n": 0})
+                          "bear_n": 0, "sl_order_id": None})
             return
 
         log.info("  → 空头持仓，无止损/翻转，维持")
@@ -667,18 +880,30 @@ def handle_short_leg(state: dict, row: pd.Series, profiles: dict,
         if (len(last_n_bear) == BEAR_CONSECUTIVE
                 and all(v == "BEAR" for v in last_n_bear)
                 and sig_ok):
-            lev = SHORT_LEV_MAP.get(bear_n, 1.0)
-            pos_ratio = 1.0 * lev
-            log.info(f"  → 开空信号: bear_n={bear_n} pos_ratio={pos_ratio}x")
-            qty = open_short(pos_ratio, current_price)
-            short.update({
-                "active":      qty > 0,
-                "pos_ratio":   pos_ratio,
-                "quantity":    qty,
-                "entry_price": current_price,
-                "entry_date":  str(today),
-                "bear_n":      bear_n,
-            })
+            # 特征过滤：macd_hist_z < -1.0 且 volume_log_z > 0
+            macd_h = float(row.get("macd_hist_z", float("nan")))
+            vol_z  = float(row.get("volume_log_z", float("nan")))
+            feat_ok = (not np.isnan(macd_h) and macd_h < SHORT_MACD_HIST_MAX
+                       and not np.isnan(vol_z) and vol_z > SHORT_VOL_MIN)
+            log.info(f"  → 空头特征检查: macd_hist_z={macd_h:.3f}(需<{SHORT_MACD_HIST_MAX}) "
+                     f"volume_log_z={vol_z:.3f}(需>{SHORT_VOL_MIN})  {'✅通过' if feat_ok else '❌过滤'}")
+            if feat_ok:
+                lev = SHORT_LEV_MAP.get(bear_n, 1.0)
+                pos_ratio = 1.0 * lev
+                log.info(f"  → 开空信号: bear_n={bear_n} pos_ratio={pos_ratio}x")
+                qty = open_short(pos_ratio, current_price)
+                sl_id = place_sl_order("short", current_price, pos_ratio) if qty > 0 else None
+                short.update({
+                    "active":       qty > 0,
+                    "pos_ratio":    pos_ratio,
+                    "quantity":     qty,
+                    "entry_price":  current_price,
+                    "entry_date":   str(today),
+                    "bear_n":       bear_n,
+                    "sl_order_id":  sl_id,
+                })
+            else:
+                slog.info(f"⏸ 空头信号被特征过滤: macd_h={macd_h:.3f} vol_z={vol_z:.3f}")
         else:
             log.info("  → 无空头信号")
 
@@ -774,11 +999,12 @@ def daily_run():
         log.error(f"读取最新行失败: {e}", exc_info=True)
         return
 
-    # 提前计算投票，供信号日志使用
+    # 提前计算投票，供信号日志使用，并写回 btc.xlsx
     try:
         _vote, _sig_ok, _bull_n, _bear_n = compute_vote(row, profiles)
         _neut_n = 6 - _bull_n - _bear_n
         _close  = row['close']
+        save_vote_to_excel(row_date, _bull_n, _bear_n, _neut_n, _vote)
     except Exception:
         _vote, _sig_ok, _bull_n, _bear_n, _neut_n, _close = '?', False, 0, 0, 0, 0
 
@@ -822,16 +1048,18 @@ def daily_run():
     if ll["active"]:
         ep  = ll["entry_price"] or 0
         pnl = (current_price / ep - 1) * ll["pos_ratio"] if ep else 0
-        slog.info(f"[多头] 持仓  {ll['pos_ratio']}x  qty={ll['quantity']} BTC"
-                  f"  entry=${ep:,.0f}  浮盈={pnl*100:+.1f}%")
+        bwin = ll.get("bear_window", [])
+        slog.info(f"[多头] 持仓  {ll['pos_ratio']}x(bull_n={ll.get('bull_n',0)})  "
+                  f"qty={ll['quantity']} BTC  entry=${ep:,.0f}  浮盈={pnl*100:+.1f}%  "
+                  f"月中BEAR窗口={bwin}")
     else:
         slog.info("[多头] 无仓位")
     # 空头
     if sl["active"]:
         ep  = sl["entry_price"] or 0
         pnl = (ep / current_price - 1) * sl["pos_ratio"] if ep else 0
-        slog.info(f"[空头] 持仓  {sl['pos_ratio']}x  qty={sl['quantity']} BTC"
-                  f"  entry=${ep:,.0f}  浮盈={pnl*100:+.1f}%")
+        slog.info(f"[空头] 持仓  {sl['pos_ratio']}x(bear_n={sl.get('bear_n',0)})  "
+                  f"qty={sl['quantity']} BTC  entry=${ep:,.0f}  浮盈={pnl*100:+.1f}%")
     else:
         slog.info(f"[空头] 无仓位  窗口={sl['vote_window']}")
 
@@ -845,6 +1073,11 @@ def daily_run():
 def main():
     # 首次启动时初始化合约设置
     init_futures_settings()
+
+    # 从 btc.xlsx 重建空头投票窗口（防止状态文件丢失或重置时丢失历史窗口）
+    _startup_state = load_state()
+    init_vote_window_from_excel(_startup_state)
+    save_state(_startup_state)
 
     if len(sys.argv) > 1 and sys.argv[1] == "daemon":
         log.info(f"Daemon 模式启动，每天 {DAILY_RUN_TIME} (UTC) 执行")

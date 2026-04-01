@@ -19,6 +19,7 @@ app = Flask(__name__)
 DATA_PATH        = '/root/Desktop/btc/get_data/get_btc_data/btc.xlsx'
 LOG_PATH         = '/root/Desktop/btc/get_data/get_btc_data/trader.log'
 SIGNAL_LOG_PATH  = '/root/Desktop/btc/get_data/get_btc_data/trader_signal.log'
+PNL_LOG_PATH     = '/root/Desktop/btc/get_data/get_btc_data/pnl_records.json'
 LOG_LINES        = 30
 # ─────────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,18 @@ def load_data():
     df['bull_n'] = bull_n_list
     df['bear_n'] = bear_n_list
     df['neut_n'] = neut_n_list
+
+    # 每日投票结果（用于 hover 背景色）
+    def _vote_result(bull, bear, neut):
+        if bull >= 4 and bull >= bear and bull >= neut:
+            return 'BULL'
+        if bear >= 4 and bear >= bull and bear >= neut:
+            return 'BEAR'
+        if neut >= 4 and neut >= bull and neut >= bear:
+            return 'NEUTRAL'
+        return 'OTHER'
+    df['vote_result'] = [_vote_result(b, be, n)
+                         for b, be, n in zip(df['bull_n'], df['bear_n'], df['neut_n'])]
     return df
 
 
@@ -125,6 +138,31 @@ def make_figure(df: pd.DataFrame, keep: dict, valid: pd.DataFrame):
     )
     CD_COLS = ['open', 'high', 'low', 'fgi', 'volume', 'bull_n', 'bear_n', 'neut_n']
 
+    # ── hover 背景色：按投票结果着色 ─────────────────────────────────
+    VOTE_BG = {
+        'BULL':    'rgba(40,167,69,0.88)',    # 绿
+        'BEAR':    'rgba(200,45,45,0.88)',     # 红
+        'NEUTRAL': 'rgba(75,85,95,0.88)',      # 灰
+        'OTHER':   'rgba(22,27,34,0.92)',      # 暗（默认）
+    }
+    VOTE_BORDER = {
+        'BULL':    'rgba(100,220,120,0.9)',
+        'BEAR':    'rgba(255,100,100,0.9)',
+        'NEUTRAL': 'rgba(150,160,170,0.9)',
+        'OTHER':   'rgba(48,54,61,0.9)',
+    }
+    def _vbg(v):     return VOTE_BG.get(str(v), VOTE_BG['OTHER'])
+    def _vborder(v): return VOTE_BORDER.get(str(v), VOTE_BORDER['OTHER'])
+    def _hl(series):
+        """生成 hoverlabel dict，bgcolor/bordercolor 均按投票结果逐点着色"""
+        vlist = list(series)
+        return dict(
+            bgcolor=[_vbg(v) for v in vlist],
+            bordercolor=[_vborder(v) for v in vlist],
+            font=dict(color='#ffffff', size=12),
+            align='left',
+        )
+
     # ── 价格折线 ──────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['close'],
@@ -132,6 +170,7 @@ def make_figure(df: pd.DataFrame, keep: dict, valid: pd.DataFrame):
         name='BTC Close',
         line=dict(color='#F7931A', width=1.6),
         customdata=df[CD_COLS].values,
+        hoverlabel=_hl(df['vote_result']),
         hovertemplate=(
             '<b>%{x|%Y-%m-%d}</b><br>'
             'Open : $%{customdata[0]:,.0f}<br>'
@@ -155,6 +194,7 @@ def make_figure(df: pd.DataFrame, keep: dict, valid: pd.DataFrame):
             name='其他组合',
             marker=dict(symbol='circle', size=5, color='#444c56', opacity=0.4),
             customdata=unclassified[CD_COLS].values,
+            hoverlabel=_hl(unclassified['vote_result']),
             hovertemplate=(
                 '<b>%{x|%Y-%m-%d}</b><br>'
                 '其他低频组合<br>'
@@ -200,6 +240,7 @@ def make_figure(df: pd.DataFrame, keep: dict, valid: pd.DataFrame):
                 line=dict(width=0.8, color='#ffffff'),
             ),
             customdata=sub[CD_COLS].values,
+            hoverlabel=_hl(sub['vote_result']),
             hovertemplate=(
                 '<b>%{x|%Y-%m-%d}</b><br>'
                 f'<b>{label}</b>  {combo_str}<br>'
@@ -316,7 +357,31 @@ TEMPLATE = """<!DOCTYPE html>
   .stat { font-size: 12px; color: #8b949e; white-space: nowrap; }
   .stat b { color: #F7931A; }
   .hint { margin-left: auto; font-size: 11px; color: #444d56; white-space: nowrap; }
-  #chart { flex: 0 0 65%; min-height: 0; width: 100%; }
+  .tab-btns {
+    display: flex;
+    gap: 4px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 2px;
+  }
+  .tab-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    background: transparent;
+    color: #8b949e;
+    transition: background 0.15s, color 0.15s;
+  }
+  .tab-btn.active {
+    background: #21262d;
+    color: #e6edf3;
+  }
+  .chart-area { flex: 0 0 65%; min-height: 0; width: 100%; position: relative; display: flex; flex-direction: column; }
+  #chart     { flex: 1 1 0; min-height: 0; }
+  #chart-pnl { flex: 1 1 0; min-height: 0; display: none; }
   .log-panel {
     flex: 1 1 0;
     min-height: 0;
@@ -360,7 +425,7 @@ TEMPLATE = """<!DOCTYPE html>
   @media (max-width: 768px) {
     .toolbar { padding: 5px 8px; gap: 6px; }
     .hint { display: none; }
-    #chart { flex: 0 0 55%; }
+    .chart-area { flex: 0 0 55%; }
   }
 </style>
 </head>
@@ -371,10 +436,17 @@ TEMPLATE = """<!DOCTYPE html>
   <span class="stat">有标签 <b>{{ labeled_rows }}</b></span>
   <span class="stat">已分组 <b>{{ classified }}</b></span>
   <span class="stat">组合数 <b>{{ combo_count }}</b>（≥3次 或 连续2次）</span>
+  <div class="tab-btns">
+    <button class="tab-btn active" id="tab-price" onclick="switchTab('price')">价格图</button>
+    <button class="tab-btn"        id="tab-pnl"   onclick="switchTab('pnl')">累计收益</button>
+  </div>
   <span class="hint">滚轮/双指缩放 · 拖动平移</span>
 </div>
 
-<div id="chart"></div>
+<div class="chart-area">
+  <div id="chart"></div>
+  <div id="chart-pnl"></div>
+</div>
 
 <div class="log-panel">
   <div class="log-col">
@@ -395,8 +467,6 @@ TEMPLATE = """<!DOCTYPE html>
 
 <script>
 // ── 价格图 ───────────────────────────────────────────────────────
-var gd = document.getElementById('chart');
-var data   = {{ graph_json | safe }};
 var config = {
   responsive: true,
   scrollZoom: true,
@@ -404,17 +474,110 @@ var config = {
   modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d'],
   displaylogo: false
 };
-Plotly.newPlot('chart', data.data, data.layout, config);
+var priceData = {{ graph_json | safe }};
+Plotly.newPlot('chart', priceData.data, priceData.layout, config);
 
 function resize() {
-  var toolbar = document.querySelector('.toolbar').offsetHeight;
+  var toolbar  = document.querySelector('.toolbar').offsetHeight;
   var logPanel = document.querySelector('.log-panel').offsetHeight;
-  var chartH = window.innerHeight - toolbar - logPanel;
-  gd.style.height = Math.max(chartH, 200) + 'px';
+  var chartH   = window.innerHeight - toolbar - logPanel;
+  document.querySelector('.chart-area').style.height = Math.max(chartH, 200) + 'px';
   Plotly.Plots.resize('chart');
+  if (document.getElementById('chart-pnl').style.display !== 'none') {
+    Plotly.Plots.resize('chart-pnl');
+  }
 }
 window.addEventListener('resize', resize);
 resize();
+
+// ── 标签切换 ─────────────────────────────────────────────────────
+var pnlLoaded = false;
+function switchTab(tab) {
+  if (tab === 'price') {
+    document.getElementById('chart').style.display     = '';
+    document.getElementById('chart-pnl').style.display = 'none';
+    document.getElementById('tab-price').classList.add('active');
+    document.getElementById('tab-pnl').classList.remove('active');
+    Plotly.Plots.resize('chart');
+  } else {
+    document.getElementById('chart').style.display     = 'none';
+    document.getElementById('chart-pnl').style.display = '';
+    document.getElementById('tab-price').classList.remove('active');
+    document.getElementById('tab-pnl').classList.add('active');
+    if (!pnlLoaded) { loadPnlChart(); } else { Plotly.Plots.resize('chart-pnl'); }
+  }
+}
+
+function loadPnlChart() {
+  fetch('/api/pnl')
+    .then(r => r.json())
+    .then(function(records) {
+      if (!records || records.length === 0) {
+        document.getElementById('chart-pnl').innerHTML =
+          '<div style="color:#8b949e;padding:40px;text-align:center;font-size:13px;">暂无已实现收益记录（首笔平仓后自动显示）</div>';
+        return;
+      }
+      var dates = records.map(function(r){ return r.close_date; });
+      // 插入起始点 0%
+      var cumVals = [0].concat(records.map(function(r){ return r.cumulative_pct; }));
+      var datesFull = [records[0].close_date].concat(dates);
+
+      var colors = records.map(function(r){
+        return r.pnl_pct >= 0 ? '#3fb950' : '#f85149';
+      });
+
+      var trace = {
+        x: datesFull,
+        y: cumVals,
+        mode: 'lines+markers',
+        name: '累计实现收益',
+        line: { color: '#58a6ff', width: 2 },
+        marker: {
+          color: ['#8b949e'].concat(colors),
+          size: 8,
+        },
+        customdata: [null].concat(records),
+        hovertemplate: (
+          '<b>%{x}</b><br>' +
+          '累计收益: <b>%{y:+.1f}%</b><br>' +
+          '本次: %{customdata.pnl_pct:+.1f}%  [%{customdata.leg} · %{customdata.reason}]<br>' +
+          'entry $%{customdata.entry_price:,.0f} → exit $%{customdata.exit_price:,.0f}' +
+          '<extra></extra>'
+        ),
+      };
+
+      var layout = {
+        template: 'plotly_dark',
+        paper_bgcolor: '#0d1117',
+        plot_bgcolor:  '#161b22',
+        font: { family: 'Arial, sans-serif', color: '#e6edf3' },
+        title: {
+          text: '实际累计收益（已平仓交易，不含浮盈）',
+          font: { size: 13, color: '#58a6ff' },
+          x: 0.01, xanchor: 'left'
+        },
+        xaxis: { showgrid: true, gridcolor: '#21262d', zeroline: false },
+        yaxis: {
+          showgrid: true, gridcolor: '#21262d', zeroline: true,
+          zerolinecolor: '#444d56', ticksuffix: '%',
+        },
+        hovermode: 'closest',
+        margin: { l: 60, r: 20, t: 40, b: 40 },
+        shapes: [{
+          type: 'line', x0: datesFull[0], x1: datesFull[datesFull.length-1],
+          y0: 0, y1: 0,
+          line: { color: '#444d56', width: 1, dash: 'dot' }
+        }],
+      };
+
+      Plotly.newPlot('chart-pnl', [trace], layout, config);
+      pnlLoaded = true;
+    })
+    .catch(function(e) {
+      document.getElementById('chart-pnl').innerHTML =
+        '<div style="color:#f85149;padding:40px;text-align:center;">加载失败: ' + e + '</div>';
+    });
+}
 
 // ── 日志面板 ─────────────────────────────────────────────────────
 function renderLog(lines, bodyId) {
@@ -508,6 +671,18 @@ def api_log():
 @app.route('/api/signal-log')
 def api_signal_log():
     return jsonify(read_log(LOG_LINES, SIGNAL_LOG_PATH))
+
+
+@app.route('/api/pnl')
+def api_pnl():
+    if not os.path.exists(PNL_LOG_PATH):
+        return jsonify([])
+    try:
+        with open(PNL_LOG_PATH, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+        return jsonify(records)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':

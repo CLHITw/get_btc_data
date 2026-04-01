@@ -47,7 +47,9 @@ for i, ym in enumerate(months):
     entry_p = row0['close']
     for idx in md_idx:
         row = valid.loc[idx]
-        if row['date'] > row0['date'] and (row['close']/entry_p - 1)*pos <= -0.15:
+        # 用当天最低价检查止损（日内最差情况）
+        worst_price = row['low'] if row['date'] > row0['date'] else row['close']
+        if row['date'] > row0['date'] and (worst_price/entry_p - 1)*pos <= -0.15:
             break
         long_pos_list[idx] = pos
 valid['long_pos'] = long_pos_list
@@ -63,7 +65,9 @@ for idx in range(len(valid)):
     if len(vote_win) > 3: vote_win.pop(0)
     last_n = vote_win[-3:] if len(vote_win) >= 3 else []
     if s_pos < 0 and s_entry:
-        pnl = (price/s_entry - 1)*(-1)*abs(s_pos)
+        # 用当天最高价检查空头止损（日内最差情况）
+        worst_price = row['high']
+        pnl = (worst_price/s_entry - 1)*(-1)*abs(s_pos)
         if pnl <= -0.08:
             s_pos, s_entry = 0.0, None; vote_win = []
         elif len(last_n)==3 and all(v=='BULL' for v in last_n):
@@ -86,11 +90,26 @@ valid['net_ret']   = valid['daily_ret'] * np_
 valid['btc_eq']    = (1 + valid['daily_ret']).cumprod()
 valid['net_eq']    = (1 + valid['net_ret']).cumprod()
 
+# ── 日内最差资产净值（用于真实最大回撤计算）────────────────────────
+# 多头持仓时，日内最低价对应最差净值；空头持仓时，日内最高价对应最差净值
+# intraday_worst_ret：当日持仓在最坏日内价格下的单日收益率
+prev_close = valid['close'].shift(1)
+long_intraday  = (valid['low']  / prev_close - 1) * lp   # 多头最坏日内
+short_intraday = (valid['high'] / prev_close - 1) * sp   # 空头最坏日内（high=亏损方向）
+valid['intraday_worst_ret'] = long_intraday + short_intraday
+
+# 对于每天：取 close-based 净值 vs 日内最差净值 两者之间更低的点
+# 构建拼接序列（每天插入一个日内最低资产净值）
+cum_base = (1 + valid['net_ret']).cumprod()
+# 日内最低权益 = 前一日权益 × (1 + 日内最差收益)
+intraday_eq = cum_base.shift(1).fillna(1.0) * (1 + valid['intraday_worst_ret'])
+valid['intraday_eq'] = intraday_eq
+
 # ── 综合指标计算 ──────────────────────────────────────────
 r    = valid['net_ret']
 btcr = valid['daily_ret']
 
-def calc_metrics(ret_series, label, total_days=TOTAL_DAYS):
+def calc_metrics(ret_series, label, total_days=TOTAL_DAYS, intraday_eq_series=None):
     r = ret_series.copy()
     cum   = (1+r).prod() - 1
     ann   = (1+cum)**(365/total_days) - 1
@@ -99,9 +118,19 @@ def calc_metrics(ret_series, label, total_days=TOTAL_DAYS):
     # Sortino（只看下行波动）
     downside = r[r < 0].std() * np.sqrt(365)
     sortino  = ann / downside if downside > 0 else 0
-    # 最大回撤
+    # 最大回撤（含日内最差价格）
     eq = (1+r).cumprod()
-    dd_series = eq / eq.cummax() - 1
+    if intraday_eq_series is not None:
+        # 合并收盘权益和日内最低权益，取更低的点来计算回撤
+        combined = pd.concat([eq, intraday_eq_series]).sort_index(kind='stable')
+        # 日内最低权益用于计算跌幅，但历史最高点仍以收盘权益为准（不用日内高点抬高基准）
+        running_max = eq.cummax()
+        # 对每个日内最低点，用其当日的收盘累计最高点作为分母
+        intraday_dd = intraday_eq_series / running_max - 1
+        close_dd    = eq / running_max - 1
+        dd_series   = pd.concat([close_dd, intraday_dd]).sort_index(kind='stable')
+    else:
+        dd_series = eq / eq.cummax() - 1
     max_dd = dd_series.min()
     # 回撤恢复时间（最大回撤后多少天恢复）
     trough_idx = dd_series.idxmin()
@@ -139,8 +168,17 @@ r_indexed.index = valid['date']
 btc_indexed = btcr.copy()
 btc_indexed.index = valid['date']
 
-strat = calc_metrics(r_indexed, '本策略（最终版）')
-btc   = calc_metrics(btc_indexed, 'BTC 买入持有')
+intraday_indexed = valid['intraday_eq'].copy()
+intraday_indexed.index = valid['date']
+
+# BTC 持有的日内最差：每天用 low 计算
+btc_intraday = (valid['low'] / valid['close'].shift(1) - 1).fillna(0)
+btc_cum_shifted = (1 + btcr).cumprod().shift(1).fillna(1.0)
+btc_intraday_eq = btc_cum_shifted * (1 + btc_intraday)
+btc_intraday_eq.index = valid['date']
+
+strat = calc_metrics(r_indexed, '本策略（最终版）', intraday_eq_series=intraday_indexed)
+btc   = calc_metrics(btc_indexed, 'BTC 买入持有', intraday_eq_series=btc_intraday_eq)
 
 print('=' * 65)
 print('  策略综合评估报告')

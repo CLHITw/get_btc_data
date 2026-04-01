@@ -274,7 +274,9 @@ def run_backtest_dynamic(df: pd.DataFrame, profiles: dict,
 
         # ── 持仓中：检查两种平仓条件 ──────────────────────────────
         if position != 0:
-            pnl = (price / entry_price - 1) * np.sign(position)
+            # 用日内最坏价格检查止损：多头用low，空头用high
+            worst_price = row['low'] if position > 0 else row['high']
+            pnl = (worst_price / entry_price - 1) * np.sign(position)
 
             # 条件1：固定止损
             if pnl <= stop_loss:

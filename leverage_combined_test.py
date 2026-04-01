@@ -73,7 +73,7 @@ def run_combined_levered(df, profiles,
                 long_pos_list[idx] = 0.0
             continue
 
-        # 月内止损检查（用杠杆后收益衡量）
+        # 月内止损检查（用当天最低价，更真实）
         entry_p = row0['close']
         stopped = False
         for idx in md_idx:
@@ -81,8 +81,8 @@ def run_combined_levered(df, profiles,
             if row['date'] == row0['date']:
                 long_pos_list[idx] = pos
                 continue
-            raw_ret = (row['close'] / entry_p - 1)
-            levered_loss = raw_ret * pos          # 杠杆后亏损
+            raw_ret = (row['low'] / entry_p - 1)   # 用日内最低价
+            levered_loss = raw_ret * pos
             if long_stop is not None and levered_loss <= long_stop:
                 stopped = True
                 # 止损后剩余月份仓位归零
@@ -111,7 +111,8 @@ def run_combined_levered(df, profiles,
         last_n = vote_win[-consecutive:] if len(vote_win) >= consecutive else []
 
         if s_pos < 0 and s_entry is not None:
-            raw_pnl = (price / s_entry - 1) * (-1)      # 空头方向
+            worst_price = row['high']                    # 空头最坏价格为日内最高
+            raw_pnl = (worst_price / s_entry - 1) * (-1)
             levered_pnl = raw_pnl * abs(s_pos)
             if levered_pnl <= short_stop:                # 止损
                 s_pos, s_entry = 0.0, None
@@ -174,7 +175,15 @@ def perf_summary(monthly, daily, name):
     cum_short = (1 + sr).prod() - 1
     ann       = (1 + cum_net) ** (365 / TOTAL_DAYS) - 1
     sharpe    = r.mean() / r.std() * np.sqrt(365) if r.std() > 0 else 0
-    dd        = ((1 + r).cumprod() / (1 + r).cumprod().cummax() - 1).min()
+    eq        = (1 + r).cumprod()
+    lp_       = daily['long_pos'].shift(1).fillna(0.0)
+    sp_       = daily['short_pos'].shift(1).fillna(0.0)
+    prev_cl   = daily['close'].shift(1)
+    intra_ret = (daily['low'] / prev_cl - 1) * lp_ + (daily['high'] / prev_cl - 1) * sp_
+    intra_eq  = eq.shift(1).fillna(1.0) * (1 + intra_ret)
+    intra_dd  = intra_eq / eq.cummax() - 1
+    close_dd  = eq / eq.cummax() - 1
+    dd        = min(close_dd.min(), intra_dd.min())
     m_rets    = monthly['net_ret_%'] / 100
     m_wr      = (m_rets > 0).mean()
 

@@ -110,8 +110,8 @@ def run_v2_stoploss(df, profiles, min_agree=4, stop=-0.08):
             for _, dr in md.iterrows():
                 if dr['date'] <= row0['date']:
                     continue
-                if (dr['close'] / entry_p - 1) <= stop:
-                    exit_p = dr['close']
+                if (dr['low'] / entry_p - 1) <= stop:   # 用日内最低价
+                    exit_p = dr['low']
                     stopped = True
                     break
         if not stopped:
@@ -194,8 +194,8 @@ def run_v_all(df, profiles, min_agree=4, stop=-0.08):
             for _, dr in md.iterrows():
                 if dr['date'] <= row0['date']:
                     continue
-                if (dr['close'] / entry_p - 1) <= stop:
-                    exit_p = dr['close']
+                if (dr['low'] / entry_p - 1) <= stop:   # 用日内最低价
+                    exit_p = dr['low']
                     stopped = True
                     break
         if not stopped:
